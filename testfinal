@@ -1,0 +1,301 @@
+Für die rechner c6597, c6598, c6599:
+	1. System vorbereiten:
+	# System aktualisieren
+	sudo apt update && sudo apt upgrade -y
+	# Hostname prüfen
+	hostname
+	# Notwendige Tools installieren
+	sudo apt install curl wget nano vim lsb-release net-tools -y
+
+0.1 Nvidia treiber mit .run datei installieren  (Im bios secure boot ausstellen!!!)
+	-> prüfen mit nvidia-smi
+0.2 nvidia container toolkit installieren (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html):
+	-> 
+	curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+	  && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+	    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+	    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+	
+	sudo apt-get update
+	
+	export NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
+	  sudo apt-get install -y \
+	      nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+	      nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+	      libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+	      libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
+	
+	Testen mit: which nvidia-container-runtime
+	
+	
+	1. 2TB-SSD einrichten
+		a. A. Partitionieren und formatieren
+			i. lsblk # finde das 2TB-Device (meistens /dev/sda)
+			ii. fdisk /dev/sda # am Prompt:
+				Eingabe im fdisk-Prompt:
+					1. Neue Partition anlegen:
+n→ Enter
+(fragt Partitionstyp: Standard ist „primary (p)“, Enter = ok)
+(fragt nach Nummer: Standard = 1, Enter = ok)
+(fragt nach erstem und letztem Sektor; einfach nur Enter drücken = komplette SSD nehmen)
+					2. Kontrollieren (optional):
+p→ Enter
+(zeigt die Partitionstabelle, es sollte eine Partition /dev/sda1 mit fast 2TB stehen)
+					3. Speichern und beenden:
+w→ Enter
+			iii. mkfs.ext4 /dev/sda1
+		b. Mountpoint anlegen und ins System einbinden
+			i. mkdir /mnt/longhorn-disk
+			ii. echo '/dev/sda1 /mnt/longhorn-disk ext4 defaults 0 2'>> /etc/fstab
+			iii. mount -a
+			iv. df -h /mnt/longhorn-disk # Kontrolle
+	2. Benutzer anlegen und Berechtigungen geben:
+		a. adduser ... 
+		b. adduser …
+		c. usermod -aG sudo  ...
+	3. Basissystem aktualisieren & konfigurieren
+		a. apt update && apt upgrade -y
+		b. hostname         # zum prüfen ob hostname z. B. C6597
+		c. Storage-Treiber installieren (PFLICHT für Longhorn):
+			i. sudo apt install open-iscsi nfs-common cryptsetup dmsetup -y
+		d. iSCSI Dienst aktivieren (PFLICHT):
+			i. sudo systemctl enable --now iscsid
+			ii. Check: systemctl status iscsid (Muss "active (running)" sein!)
+
+Kernel-Parameter: Netzwerk für Pods freischalten (auf allen nodes)
+	sudo modprobe br_netfilter
+	echo "net.bridge.bridge-nf-call-iptables=1"| sudo tee -a /etc/sysctl.conf
+	echo "net.bridge.bridge-nf-call-ip6tables=1"| sudo tee -a /etc/sysctl.conf
+	echo "net.ipv4.ip_forward=1"| sudo tee -a /etc/sysctl.conf
+	sudo sysctl -p
+
+
+K3s-Cluster aufsetzen:
+	1. Für den ersten master-rechner (c6597)
+		a. curl -sfL https://get.k3s.io |INSTALL_K3S_EXEC="server \--cluster-init \--disable traefik \--flannel-backend=none"sh -
+		b. sudo cat /var/lib/rancher/k3s/server/node-token
+	2. Auf den anderen beiden rechnern (c6598 und c6599):
+		a. curl -sfL https://get.k3s.io |INSTALL_K3S_EXEC="server \--server https://10.52.94.8:6443 \--token <TOKEN> \--disable traefik \--flannel-backend=none"sh -
+	3. Egal auf welchem Rechner:
+		a. sudo kubectl get nodes # prüfen obs geklappt hat
+	4. Kubectl auf ki_user sichtbar machen:
+		mkdir -p ~/.kube
+		sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+		sudo chown $USER:$USER~/.kube/config
+		-> in file ~/.kube/config muss server ip die ip von c6597 mit port sein nicht 127.0.0.1:6443 !!!!!
+		(echo 'export KUBECONFIG=$HOME/.kube/config'>> ~/.bashrc)
+		(source ~/.bashrc)
+		
+	5. Cilium installieren:
+		curl -L --remote-name https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
+tar xzvf cilium-linux-amd64.tar.gz
+sudo mv cilium /usr/local/bin/
+		cilium install
+		
+	6. MetalLB installieren
+		kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml
+		
+		Mit nano file erstellen:  metallb.yaml mit dem inhalt:
+		apiVersion: metallb.io/v1beta1
+		kind: IPAddressPool
+		metadata:
+		  name: default
+		  namespace: metallb-system
+		spec:
+		  addresses:
+		  - 10.52.94.201-10.52.94.210
+		---
+		apiVersion: metallb.io/v1beta1
+		kind: L2Advertisement
+		metadata:
+		  name: default
+		  namespace: metallb-system
+		
+		
+		Dann:
+		kubectl apply -f metallb.yaml
+		
+		
+Für longhorn (nur auf c6597):
+	Helm installieren:
+		a. sudo snap install helm --classic
+	Longhorn Namespace und CRDs anlegen:
+		kubectl create namespace longhorn-system
+	Longhorn via Helm installieren:
+		helm install longhorn longhorn/longhorn \
+		--namespace longhorn-system \
+		--set persistence.defaultClass=true\
+		--set persistence.defaultClassReplicaCount=3\
+		--set persistence.defaultDataPath="/mnt/longhorn-disk"
+	
+NVIDIA GPU Operator für Kubernetes installieren:
+	- Auf jedem rechner:
+		nvidia-smi muss was anzeigen!
+	- Auf dem c6597:
+	# NVIDIA Helm-Repo hinzufügen
+	helm repo add nvidia https://nvidia.github.io/gpu-operator
+	helm repo update
+	# Namespace für Operator anlegen
+	kubectl create namespace gpu-operator
+	# Operator installieren:
+	helm install gpu-operator nvidia/gpu-operator --namespace gpu-operator \
+	--set toolkit.env[0].name=CONTAINERD_SOCKET \
+	--set toolkit.env[0].value=/run/k3s/containerd/containerd.sock
+	
+	Dann testen mit: kubectl get pods -n gpu-operator
+			         kubectl get nodes "-o=custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu"
+
+File erstellen: ollama-daemonset.yaml mit dem inhalt:
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ollama
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama
+        ports:
+        - containerPort: 11434
+        resources:
+          limits:
+            nvidia.com/gpu: 2
+        volumeMounts:
+        - mountPath: /root/.ollama
+          name: ollama-data
+        - mountPath: /etc/ssl/certs
+          name: etc-ssl-certs
+          readOnly: true
+      volumes:
+      - name: ollama-data
+        hostPath:
+          path: /data/ollama
+      - name: etc-ssl-certs
+        hostPath:
+          path: /etc/ssl/certs
+
+
+Dann auf allen nodes vorbereiten:
+sudo mkdir -p /data/ollama
+sudo chown 1000:1000 /data/ollama
+
+Auf c6597 deployen:
+kubectl apply -f ollama-daemonset.yaml
+
+5. Modelle lokal auf den Nodes laden
+kubectl get pods -l app=ollama
+
+In jeden Pod das Modell laden (repeat für alle Pods):
+kubectl exec -it <Ollama-Pod-Name> -- ollama pull gpt-oss:20b (z. B. kubectl exec -it ollama-xyz -- ollama pull gpt-oss:20b)
+
+
+
+(NEU) Kubernetes-Service für Ollama anlegen
+ollama-service.yaml anlegen mit inhalt:
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: default
+spec:
+  selector:
+    app: ollama
+  ports:
+    - protocol: TCP
+      port: 11434
+      targetPort: 11434
+
+
+Deployen:
+kubectl apply -f ollama-service.yaml
+
+PVC für OpenWebUI:
+Erstelle datei: openwebui-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openwebui-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+
+kubectl apply -f openwebui-pvc.yaml
+
+
+
+Deployment für OpenWebUI (webui-deployment.yaml):
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openwebui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openwebui
+  template:
+    metadata:
+      labels:
+        app: openwebui
+    spec:
+      containers:
+      - name: openwebui
+        image: ghcr.io/open-webui/open-webui:main
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - mountPath: /app/backend/data
+          name: webui-data
+      volumes:
+      - name: webui-data
+        persistentVolumeClaim:
+          claimName: openwebui-pvc
+
+
+kubectl apply -f webui-deployment.yaml
+
+
+
+
+Service für OpenWebUI (webui-svc.yaml): 
+
+apiVersion: v1
+kind: Service
+metadata:
+name: openwebui
+spec:
+type: LoadBalancer
+loadBalancerIP: 10.52.94.201
+selector:
+app: openwebui
+ports:
+- port: 80
+targetPort: 8080
+
+kubectl apply -f webui-svc.yaml
+
+Abschlusstests
+Nvidia-Treiber im Container testen
+kubectl get pods -A
+kubectl exec -it <ollama-pod> -- nvidia-smi
+
+
+Pods/Nodes checken:
+kubectl get pods -A
+kubectl get nodes
+
+Frontend im Browser aufrufen:
+http://10.52.94.201
