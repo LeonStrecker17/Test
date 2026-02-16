@@ -1,0 +1,237 @@
+Aufbau eines HA-K3s-Clusters mit GPU-Unterstützung
+Folgende Anleitung zeigt Schritt für Schritt, wie Sie auf drei Ubuntu 24.04-Workstations (IPs 10.52.94.8, 10.52.94.9, 10.52.94.10) mit je zwei NVIDIA-GPUs (A1000 und RTX Ada 5000) ein hochverfügbares K3s-Cluster mit eingebettetem etcd aufbauen. Dabei werden Flannel deaktiviert und Cilium als CNI installiert, MetalLB im Layer2-Modus mit einer festen IP (z.B. 10.52.94.201) eingerichtet, der NVIDIA GPU Operator installiert, und schließlich Ollama + OpenWebUI per DaemonSet deployed. Alle Beispiele nutzen die realen IPs und Konfigurationen.
+1. System vorbereiten und NVIDIA-Treiber installieren
+Auf allen drei Maschinen: Aktualisieren und NVIDIA-Treiber installieren. Beispiel mit Ubuntu-Paketen und dem Nvidia-Container-Toolkit (erlaubt Container-GPU-Nutzung)��:
+docs.leaf.cloud
+docs.k3s.io
+Bash
+Code kopieren
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y ubuntu-drivers-common
+sudo ubuntu-drivers autoinstall       # installiert den empfohlenen NVIDIA-Treiber
+sudo reboot                           # Neustart nach Treiber-Installation
+# Nach Reboot: Überprüfung
+nvidia-smi                            # Ausgabe der GPU-Informationen prüfen
+
+# NVIDIA Container Toolkit einrichten (erforderlich für Container-GPU-Zugriff):
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt update
+sudo apt install -y nvidia-container-toolkit nvidia-container-runtime cuda-drivers-fabricmanager-535 nvidia-headless-535-server
+# K3s-Nutzer beachten: K3s integriert automatisch die NV-Runtime in containerd2.
+Damit sind die GPUs systemweit installiert und das Container-Runtime-Framework (Containerd) kann auf die NVIDIA-GPUs zugreifen.
+2. K3s-Cluster im HA-Modus installieren
+Auf Server 1 (10.52.94.8) das erste K3s-Server-Node starten und dabei Flannel deaktivieren. Wir benutzen den eingebetteten etcd für HA. Beispielbefehl für Server 1:
+Bash
+Code kopieren
+export K3S_TOKEN="GeheimesToken123"   # gemeinsames Token für alle Server
+curl -sfL https://get.k3s.io | K3S_TOKEN=$K3S_TOKEN sh -s - server \
+    --cluster-init \
+    --flannel-backend=none --disable-network-policy \
+    --tls-san=10.52.94.8
+Hier bewirkt --cluster-init, dass dieser Server das erste etcd-Quorum initiiert. Mit --flannel-backend=none --disable-network-policy wird Flannel ausgeschaltet, wie für Cilium erforderlich��. Das --tls-san=10.52.94.8 stellt sicher, dass der API-Server das Zertifikat für diese IP ausstellt.
+docs.k3s.io
+docs.cilium.io
+Auf Server 2 (10.52.94.9) und Server 3 (10.52.94.10) K3s als weitere Server ins Cluster aufnehmen:
+Bash
+Code kopieren
+# Auf 10.52.94.9 (Server 2):
+curl -sfL https://get.k3s.io | K3S_TOKEN=$K3S_TOKEN sh -s - server \
+    --server https://10.52.94.8:6443 \
+    --flannel-backend=none --disable-network-policy \
+    --tls-san=10.52.94.8
+
+# Auf 10.52.94.10 (Server 3):
+curl -sfL https://get.k3s.io | K3S_TOKEN=$K3S_TOKEN sh -s - server \
+    --server https://10.52.94.8:6443 \
+    --flannel-backend=none --disable-network-policy \
+    --tls-san=10.52.94.8
+Wichtig ist, dass bei allen Servern die Netzwerk-Flags --flannel-backend=none --disable-network-policy identisch sind�. Nach erfolgreicher Installation sollten alle drei Nodes als control-plane mit etcd-Instanz im kubectl get nodes erscheinen.
+docs.cilium.io
+3. Cilium als CNI installieren
+Da wir Flannel deaktiviert haben, installieren wir Cilium als CNI. Mit dem Cilium-CLI (alternativ Helm) lässt sich Cilium unter K3s installieren. Beispiel:
+Bash
+Code kopieren
+# Kubeconfig für kubectl setzen (auf Server 1, da K3s installiert):
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+# Cilium-CLI installieren:
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz{,.sha256sum}
+sha256sum --check cilium-linux-amd64.tar.gz.sha256sum
+sudo tar xzvfC cilium-linux-amd64.tar.gz /usr/local/bin
+rm cilium-linux-amd64.tar.gz{,.sha256sum}
+
+# Cilium installieren (Standard-Konfiguration nutzt meist tunnelloses UVLAN/IPAM):
+cilium install
+Damit setzt Cilium die Pod-Netzwerkzuweisungen auf, ersetzt das (deaktivierte) Flannel. Nach wenigen Minuten sollten Cilium-Pods in cilium-Namespace laufen (kubectl get pods -n kube-system oder im cilium-Namespace). Cilium übernimmt dann das Routing der Pod-Netzwerke.
+4. MetalLB im Layer2-Modus einrichten
+MetalLB stellt einen LoadBalancer auf Bare-Metal bereit. Wir installieren MetalLB im Layer2-Modus und reservieren die IP 10.52.94.201 für externe Anfragen. Beispiel:
+Bash
+Code kopieren
+# MetalLB-Manifest herunterladen und anwenden:
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.14/config/manifests/metallb-native.yaml
+
+# Warten bis MetalLB-Controller und Speaker laufen (namespace metallb-system).
+kubectl -n metallb-system get pods
+
+# Konfigurations-ConfigMap mit IP-Pool erstellen:
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: metallb-system
+  name: config
+data:
+  config: |
+    address-pools:
+    - name: default
+      protocol: layer2
+      addresses:
+      - 10.52.94.201-10.52.94.201
+EOF
+In der ConfigMap weisen wir MetalLB an, im Layer2-Modus die IP 10.52.94.201 zu vergeben�. Über diese IP erreichen wir später externe LoadBalancer-Services. Das Interne Policy ist standardmäßig Cluster, sodass eingehende Verbindungen auf die Service-Pods verteilt werden.
+v0-7-3--metallb.netlify.app
+5. NVIDIA GPU Operator installieren
+Der NVIDIA GPU Operator übernimmt die Installation des NVIDIA-Kubernetes-Plugins und Treiber-Upgrades. Mit Helm installieren wir ihn im Namespace gpu-operator:
+Bash
+Code kopieren
+kubectl create namespace gpu-operator
+# (Falls PodSecurityPolicies o.ä. greifen, könnte man den Namespace frei-labeln, hier standardmäßig privilegiert)
+# Helm-Repository hinzufügen und aktualisieren:
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia && helm repo update
+# GPU Operator installieren:
+helm install gpu-operator nvidia/gpu-operator --namespace gpu-operator --version v25.10.1 --wait
+Dieser Befehl installiert den aktuellen GPU Operator samt nötiger Komponenten wie NVIDIA Device Plugin und Treiber-Container�. Nach wenigen Augenblicken sollten die GPU-Operator-Pods laufen. Mit kubectl get nodes sehen Sie jetzt bei jedem Node in den Allocatable-Ressourcen nvidia.com/gpu: 2 stehen, die GPUs sind für K8s-Pods verfügbar.
+docs.nvidia.com
+6. DaemonSets für Ollama und OpenWebUI erstellen
+Wir deployen ein DaemonSet mit Ollama, das auf jedem Node läuft und das Modell gpt-oss:20b nutzt sowie beide GPUs. Zusätzlich ein weiteres DaemonSet für OpenWebUI (Web-UI), das sich mit dem lokalen Ollama-Server verbindet. Beispiele für die Kubernetes-YAML:
+6.1. Ollama DaemonSet
+Yaml
+Code kopieren
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ollama
+  labels: { app: ollama }
+spec:
+  selector:
+    matchLabels: { app: ollama }
+  template:
+    metadata:
+      labels: { app: ollama }
+    spec:
+      containers:
+      - name: ollama
+        image: ghcr.io/ollama/ollama:latest
+        securityContext:
+          # Container braucht GPU-Zugriff
+          resources: {}
+        resources:
+          limits:
+            nvidia.com/gpu: 2
+        env:
+        - name: OLLAMA_MODELS
+          value: "/usr/share/ollama/.ollama/models"
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          # Ollama-Server starten
+          ollama serve &
+          # Warten, bis Ollama bereit ist
+          while ! ollama list | grep -q 'NAME'; do sleep 1; done
+          # Modell herunterladen und laden
+          ollama pull gpt-oss:20b
+          wait
+        ports:
+        - containerPort: 11434
+          name: ollama-api
+Dieses DaemonSet startet Ollama im Hintergrund (ollama serve) und lädt das Modell gpt-oss:20b automatisch herunter��. Es beschränkt die Ressourcen auf 2 GPUs per limits: nvidia.com/gpu: 2, damit der Ollama-Prozess beide GPUs nutzen kann. Port 11434 ist der standardmäßige Ollama-API-Port.
+stackoverflow.com
+stackoverflow.com
+6.2. Service für Ollama
+Damit OpenWebUI oder andere Clients Ollama erreichen, legen wir einen internen Service an:
+Yaml
+Code kopieren
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+spec:
+  selector: { app: ollama }
+  ports:
+  - name: api
+    port: 11434
+    targetPort: 11434
+  type: ClusterIP
+Dieser Service ollama vermittelt Zugriffe auf Port 11434 an einen der Ollama-Pods (aus dem DaemonSet).
+6.3. OpenWebUI DaemonSet
+Yaml
+Code kopieren
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: openwebui
+  labels: { app: openwebui }
+spec:
+  selector:
+    matchLabels: { app: openwebui }
+  template:
+    metadata:
+      labels: { app: openwebui }
+    spec:
+      containers:
+      - name: openwebui
+        image: ghcr.io/open-webui/open-webui:main
+        env:
+        - name: OLLAMA_BASE_URL
+          value: "http://ollama:11434"
+        - name: WEBUI_AUTH
+          value: "False"     # Login deaktivieren (Ein-Benutzer-Modus)
+        ports:
+        - containerPort: 8080
+          name: ui
+Das OpenWebUI-DaemonSet startet den Web-Uplift-UI-Container auf jedem Node (ContainerPort 8080). Durch die Umgebungsvariable OLLAMA_BASE_URL wird das lokale Ollama (ClusterIP-Service ollama:11434) als Backend verwendet. Der auth-Modus wird hier auf „False“ gesetzt, damit beim erstmaligen Aufruf keine Anmeldung erforderlich ist.
+6.4. LoadBalancer-Service für OpenWebUI
+Damit OpenWebUI von außen erreichbar ist, erstellen wir einen LoadBalancer-Service mit der MetalLB-IP 10.52.94.201:
+Yaml
+Code kopieren
+apiVersion: v1
+kind: Service
+metadata:
+  name: openwebui-lb
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 10.52.94.201
+  selector: { app: openwebui }
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+Dieser Service liefert den Content der OpenWebUI (Port 8080 in den Pods) nach außen auf Port 80 unter der IP 10.52.94.201. MetalLB weist diese IP zu und leitet sie an einen der OpenWebUI-Pods weiter (Standard-TrafficPolicy Cluster, gleichmäßige Verteilung).
+7. Überprüfung und Tests
+Nach der Einrichtung prüfen wir Funktionsfähigkeit und Status:
+GPU-Nutzung: Auf den Nodes sollte nvidia-smi jetzt laufende Prozessen für Ollama zeigen. Auch in Kubernetes kann man mit kubectl get nodes -o wide sehen, dass Allocatable  nvidia.com/gpu: 2 vorhanden ist. Innerhalb eines Ollama-Pods kann kubectl exec -it <ollama-pod> -- nvidia-smi ausgeführt werden, um GPU-Auslastung anzuzeigen.
+Cluster-Zustand: Prüfen Sie alle Knoten und Pods:
+Bash
+Code kopieren
+kubectl get nodes
+kubectl get pods -A
+Alle drei Server-Nodes sollten Ready sein. Im Namespace kube-system laufen u.a. cilium, im Namespace metallb-system der MetalLB Speaker, im Namespace gpu-operator die GPU-Operator-Pods.
+Pod-Kommunikation: Um die Netzwerkkonnektivität zu testen, können Sie z.B. ein einfaches Pod starten und den OpenWebUI-Service anpingen:
+Bash
+Code kopieren
+kubectl run -it --rm pingtest --image=busybox -- /bin/sh
+# im Pod:
+wget -qO- http://ollama:11434/health  # Wenn Ollama eine Health-URL hat
+ping -c 3 ollama
+Damit sehen Sie, dass der ollama-Service erreichbar ist. Auch zwischen anderen Pods sollte die Kommunikation klappen (kein Flannel, daher Cilium-eigene Konnektivität).
+Service-Verfügbarkeit: Greifen Sie von Ihrem lokalen Rechner auf die IP 10.52.94.201 zu (ggf. Port 80, falls Firewall geöffnet). Dort sollte die OpenWebUI erscheinen. Alternativ:
+Bash
+Code kopieren
+curl -I http://10.52.94.201
+Sie sollten HTTP-200 oder Weiterleitung sehen. In einem Browser kann dann das WebUI geladen werden und mit dem Modell gpt-oss:20B gechattet werden.
+Alle YAML-Beispiele oben enthalten die echten IPs 10.52.94.x bzw. 10.52.94.201. Zusammen bilden diese Schritte ein vollständiges HA-K3s-Cluster mit NVIDIA-GPU-Unterstützung, Cilium-Netzwerk, MetalLB und einer KI-Dienst-Deployment (Ollama + OpenWebUI), wie gewünscht.
+Quellen: Die Vorgehensweisen und Konfigurationsbeispiele basieren auf der offiziellen Dokumentation von K3s, Cilium, MetalLB und NVIDIA sowie Community Guides����. Für Ollama und OpenWebUI wurden etablierte Docker- und Kubernetes-Setups herangezogen���.
