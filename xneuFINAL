@@ -1,0 +1,390 @@
+ich habe 3 rechner im vlan. für dieses habe ich cluster gemacht um openwebui ausfallsicher mit lokalen ollama modellen zu betreiben:
+Für die rechner c6597, c6598, c6599:
+
+System vorbereiten:
+System aktualisieren
+sudo apt update && sudo apt upgrade -y
+
+Hostname prüfen
+hostname
+
+Notwendige Tools installieren
+sudo apt install curl wget nano vim lsb-release net-tools -y
+0.1 Nvidia treiber mit .run datei installieren (Im bios secure boot ausstellen!!!)
+-> prüfen mit nvidia-smi
+0.2 nvidia container toolkit installieren (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html):
+->
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+&& curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list |
+sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' |
+sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update
+export NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
+sudo apt-get install -y
+nvidia-container-toolkit=NVIDIA 
+C
+​
+ ONTAINER 
+T
+​
+ OOLKIT 
+V
+​
+ ERSION nvidia−container−toolkit−base={NVIDIA_CONTAINER_TOOLKIT_VERSION}
+libnvidia-container-tools=NVIDIA 
+C
+​
+ ONTAINER 
+T
+​
+ OOLKIT 
+V
+​
+ ERSION libnvidia−container1={NVIDIA_CONTAINER_TOOLKIT_VERSION}
+Testen mit: which nvidia-container-runtime
+
+2TB-SSD einrichten
+a. A. Partitionieren und formatieren
+i. lsblk # finde das 2TB-Device (meistens /dev/sda)
+ii. fdisk /dev/sda # am Prompt:
+Eingabe im fdisk-Prompt:
+Neue Partition anlegen:
+n→ Enter
+(fragt Partitionstyp: Standard ist „primary (p)“, Enter = ok)
+(fragt nach Nummer: Standard = 1, Enter = ok)
+(fragt nach erstem und letztem Sektor; einfach nur Enter drücken = komplette SSD nehmen)
+Kontrollieren (optional):
+p→ Enter
+(zeigt die Partitionstabelle, es sollte eine Partition /dev/sda1 mit fast 2TB stehen)
+Speichern und beenden:
+w→ Enter
+iii. mkfs.ext4 /dev/sda1
+b. Mountpoint anlegen und ins System einbinden
+i. mkdir /mnt/longhorn-disk
+ii. echo '/dev/sda1 /mnt/longhorn-disk ext4 defaults 0 2'>> /etc/fstab
+iii. mount -a
+iv. df -h /mnt/longhorn-disk # Kontrolle
+Benutzer anlegen und Berechtigungen geben:
+a. adduser
+b. adduser …
+c. usermod -aG sudo
+Basissystem aktualisieren & konfigurieren
+a. apt update && apt upgrade -y
+b. hostname # zum prüfen ob hostname z. B. C6597
+c. Storage-Treiber installieren (PFLICHT für Longhorn):
+i. sudo apt install open-iscsi nfs-common cryptsetup dmsetup -y
+d. iSCSI Dienst aktivieren (PFLICHT):
+i. sudo systemctl enable --now iscsid
+ii. Check: systemctl status iscsid (Muss "active (running)" sein!)
+Kernel-Parameter: Netzwerk für Pods freischalten (auf allen nodes)
+sudo modprobe br_netfilter
+echo "net.bridge.bridge-nf-call-iptables=1"| sudo tee -a /etc/sysctl.conf
+echo "net.bridge.bridge-nf-call-ip6tables=1"| sudo tee -a /etc/sysctl.conf
+echo "net.ipv4.ip_forward=1"| sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+K3s-Cluster aufsetzen:
+Für den ersten master-rechner (c6597)
+a. curl -sfL https://get.k3s.io |INSTALL_K3S_EXEC="server --cluster-init --disable traefik --flannel-backend=none"sh -
+b. sudo cat /var/lib/rancher/k3s/server/node-token
+Auf den anderen beiden rechnern (c6598 und c6599):
+a. curl -sfL https://get.k3s.io |INSTALL_K3S_EXEC="server --server https://10.52.94.8:6443 --token <TOKEN> --disable traefik --flannel-backend=none"sh -
+Egal auf welchem Rechner:
+a. sudo kubectl get nodes # prüfen obs geklappt hat
+Kubectl auf ki_user sichtbar machen:
+mkdir -p ~/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown $USER:$USER~/.kube/config
+-> in file ~/.kube/config muss server ip die ip von c6597 mit port sein nicht 127.0.0.1:6443 !!!!!
+(echo 'export KUBECONFIG=$HOME/.kube/config'>> ~/.bashrc)
+(source ~/.bashrc)
+Cilium installieren:
+curl -L --remote-name https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz
+tar xzvf cilium-linux-amd64.tar.gz
+sudo mv cilium /usr/local/bin/
+cilium install
+MetalLB installieren
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml
+Mit nano file erstellen: metallb.yaml mit dem inhalt:
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+name: default
+namespace: metallb-system
+spec:
+addresses:
+10.52.94.201-10.52.94.210
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+name: default
+namespace: metallb-system
+Dann:
+kubectl apply -f metallb.yaml
+Für longhorn (nur auf c6597):
+Helm installieren:
+a. sudo snap install helm --classic
+Longhorn Namespace und CRDs anlegen:
+kubectl create namespace longhorn-system
+Longhorn via Helm installieren:
+helm install longhorn longhorn/longhorn
+--namespace longhorn-system
+--set persistence.defaultClass=true
+--set persistence.defaultClassReplicaCount=3
+--set persistence.defaultDataPath="/mnt/longhorn-disk"
+NVIDIA GPU Operator für Kubernetes installieren:
+
+Auf jedem rechner:
+nvidia-smi muss was anzeigen!
+Auf dem c6597:
+NVIDIA Helm-Repo hinzufügen
+helm repo add nvidia https://nvidia.github.io/gpu-operator
+helm repo update
+
+Namespace für Operator anlegen
+kubectl create namespace gpu-operator
+
+Operator installieren:
+helm install gpu-operator nvidia/gpu-operator --namespace gpu-operator
+--set toolkit.env[0].name=CONTAINERD_SOCKET
+--set toolkit.env[0].value=/run/k3s/containerd/containerd.sock
+Dann testen mit: kubectl get pods -n gpu-operator
+kubectl get nodes "-o=custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu"
+File erstellen: ollama-daemonset.yaml mit dem inhalt:
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+name: ollama
+namespace: default
+spec:
+selector:
+matchLabels:
+app: ollama
+template:
+metadata:
+labels:
+app: ollama
+spec:
+containers:
+- name: ollama
+image: ollama/ollama
+ports:
+- containerPort: 11434
+resources:
+limits:
+nvidia.com/gpu: 2
+volumeMounts:
+- mountPath: /root/.ollama
+name: ollama-data
+- mountPath: /etc/ssl/certs
+name: etc-ssl-certs
+readOnly: true
+volumes:
+- name: ollama-data
+hostPath:
+path: /data/ollama
+- name: etc-ssl-certs
+hostPath:
+path: /etc/ssl/certs
+Dann auf allen nodes vorbereiten:
+sudo mkdir -p /data/ollama
+sudo chown 1000:1000 /data/ollama
+Auf c6597 deployen:
+kubectl apply -f ollama-daemonset.yaml
+5. Modelle lokal auf den Nodes laden
+kubectl get pods -l app=ollama
+In jeden Pod das Modell laden (repeat für alle Pods):
+kubectl exec -it <Ollama-Pod-Name> -- ollama pull gpt-oss:20b (z. B. kubectl exec -it ollama-xyz -- ollama pull gpt-oss:20b)
+(NEU) Kubernetes-Service für Ollama anlegen
+ollama-service.yaml anlegen mit inhalt:
+apiVersion: v1
+kind: Service
+metadata:
+name: ollama
+namespace: default
+spec:
+selector:
+app: ollama
+ports:
+- protocol: TCP
+port: 11434
+targetPort: 11434
+Deployen:
+kubectl apply -f ollama-service.yaml
+PVC für OpenWebUI:
+Erstelle datei: openwebui-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+name: openwebui-pvc
+spec:
+accessModes:
+- ReadWriteOnce
+resources:
+requests:
+storage: 50Gi
+kubectl apply -f openwebui-pvc.yaml
+Erstelle/editiere auf ALLEN Nodes:
+/etc/rancher/k3s/registries.yaml
+Mit folgendem inhalt:
+mirrors:
+"10.52.94.4:5000":
+endpoint:
+
+"http://10.52.94.4:5000"
+Dann au allen drei nodes:
+sudo systemctl restart k3s
+Deployment für OpenWebUI (openwebui-deployment.yaml):
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+name: openwebui
+spec:
+replicas: 1
+selector:
+matchLabels:
+app: openwebui
+template:
+metadata:
+labels:
+app: openwebui
+spec:
+containers:
+- name: openwebui
+image: 10.52.94.4:5000/openwebui:v2
+ports:
+- containerPort: 8080
+volumeMounts:
+- mountPath: /app/backend/data
+name: openwebui-data
+- mountPath: /etc/ssl/certs
+name: etc-ssl-certs
+readOnly: true
+env:
+- name: CORS_ALLOW_ORIGIN
+value: "*"
+volumes:
+- name: openwebui-data
+persistentVolumeClaim:
+claimName: openwebui-pvc
+- name: etc-ssl-certs
+hostPath:
+path: /etc/ssl/certs
+kubectl apply -f webui-deployment.yaml
+Service für OpenWebUI (webui-svc.yaml):
+apiVersion: v1
+kind: Service
+metadata:
+name: openwebui
+spec:
+type: LoadBalancer
+loadBalancerIP: 10.52.94.201
+selector:
+app: openwebui
+ports:
+
+port: 80
+targetPort: 8080
+kubectl apply -f webui-svc.yaml
+Abschlusstests
+(Nvidia-Treiber im Container testen
+kubectl get pods -A
+kubectl exec -it <ollama-pod> -- nvidia-smi)
+Pods/Nodes checken:
+kubectl get pods -A
+kubectl get nodes
+Frontend im Browser aufrufen:
+http://10.52.94.201
+http://10.52.94.8:32677/
+http://10.52.94.9:32677/
+http://10.52.94.10:32677/
+Ollama ip eintragen bei connections:
+http://ollama:11434
+tests:
+wenn openwebui pod zb auf c6598 läuft und ich den ausschalte wird neuer pod auf c6598 erstellt und openwebui läuft weiter. wenn ich den c6597 runterfahre dann läuft chatbot zwar auch weiter aber die ganzen modelle sind nicht mehr da. sieht dann so aus:
+ki_user@C6598:~$ sudo kubectl get pods -A
+NAMESPACE NAME READY STATUS RESTARTS AGE
+default ollama-j7b9d 1/1 Running 0 25h
+default ollama-ls9gw 1/1 Running 0 123m
+default ollama-xpqw4 1/1 Running 0 25h
+default openwebui-5657945fdb-8zksr 1/1 Running 0 3h16m
+gpu-operator gpu-feature-discovery-lnjmr 1/1 Running 0 25h
+gpu-operator gpu-feature-discovery-tjh6m 1/1 Running 0 25h
+gpu-operator gpu-feature-discovery-vgdws 1/1 Running 4 (123m ago) 25h
+gpu-operator gpu-operator-7569f8b499-2cpdq 0/1 Running 4 (63s ago) 3m21s
+gpu-operator gpu-operator-7569f8b499-qfcmf 1/1 Terminating 2 (25h ago) 25h
+gpu-operator gpu-operator-node-feature-discovery-gc-55ffc49ccc-r9j9t 1/1 Running 0 25h
+gpu-operator gpu-operator-node-feature-discovery-master-6b5787f695-475f9 1/1 Terminating 1 (25h ago) 25h
+gpu-operator gpu-operator-node-feature-discovery-master-6b5787f695-9tncc 0/1 Running 0 3m21s
+gpu-operator gpu-operator-node-feature-discovery-worker-6746s 1/1 Running 0 25h
+gpu-operator gpu-operator-node-feature-discovery-worker-6rcj8 1/1 Running 4 (123m ago) 25h
+gpu-operator gpu-operator-node-feature-discovery-worker-vpx7t 1/1 Running 0 25h
+gpu-operator nvidia-container-toolkit-daemonset-fjq2d 1/1 Running 0 25h
+gpu-operator nvidia-container-toolkit-daemonset-kr2rb 1/1 Running 0 25h
+gpu-operator nvidia-container-toolkit-daemonset-rrscm 1/1 Running 4 (123m ago) 25h
+gpu-operator nvidia-cuda-validator-42jd8 0/1 Completed 0 122m
+gpu-operator nvidia-cuda-validator-zvchs 0/1 Completed 0 25h
+gpu-operator nvidia-dcgm-exporter-4qvb7 1/1 Running 0 25h
+gpu-operator nvidia-dcgm-exporter-5j2vj 1/1 Running 0 25h
+gpu-operator nvidia-dcgm-exporter-s2hqt 1/1 Running 4 (123m ago) 25h
+gpu-operator nvidia-device-plugin-daemonset-2zkcx 1/1 Running 0 25h
+gpu-operator nvidia-device-plugin-daemonset-8ngfr 1/1 Running 4 (123m ago) 25h
+gpu-operator nvidia-device-plugin-daemonset-b7m7r 1/1 Running 0 25h
+gpu-operator nvidia-operator-validator-sdjc4 1/1 Running 4 (123m ago) 25h
+gpu-operator nvidia-operator-validator-z78vt 1/1 Running 0 25h
+gpu-operator nvidia-operator-validator-zw8k4 1/1 Running 0 25h
+kube-system cilium-4vn6m 1/1 Running 0 26h
+kube-system cilium-envoy-8h2t2 1/1 Running 0 26h
+kube-system cilium-envoy-lf2fq 1/1 Running 4 (123m ago) 26h
+kube-system cilium-envoy-mmjbc 1/1 Running 0 26h
+kube-system cilium-kc9tb 0/1 Running 0 26h
+kube-system cilium-operator-769b6ddcf-cbdmf 0/1 CrashLoopBackOff 5 (2m14s ago) 3h50m
+kube-system cilium-pdq8n 0/1 Running 4 (123m ago) 26h
+kube-system coredns-695cbbfcb9-g8l4v 1/1 Terminating 0 3h50m
+kube-system coredns-695cbbfcb9-wstl2 0/1 Running 2 (29s ago) 3m21s
+kube-system local-path-provisioner-546dfc6456-jnx6f 0/1 CrashLoopBackOff 3 (41s ago) 3m21s
+kube-system local-path-provisioner-546dfc6456-wg292 1/1 Terminating 0 3h50m
+kube-system metrics-server-c8774f4f4-7f2lv 0/1 CrashLoopBackOff 3 (36s ago) 3m21s
+kube-system metrics-server-c8774f4f4-c5zm9 1/1 Terminating 0 3h50m
+kube-system svclb-openwebui-eabfb94e-7mbbs 1/1 Running 4 (123m ago) 22h
+kube-system svclb-openwebui-eabfb94e-dkdk9 1/1 Running 0 22h
+kube-system svclb-openwebui-eabfb94e-n8zrz 1/1 Running 0 22h
+longhorn-system csi-attacher-896ffc747-9vg6h 1/1 Terminating 0 3h50m
+longhorn-system csi-attacher-896ffc747-c2vxf 1/1 Terminating 0 25h
+longhorn-system csi-attacher-896ffc747-g5t66 1/1 Running 0 3m21s
+longhorn-system csi-attacher-896ffc747-mz9bj 1/1 Running 2 (25h ago) 25h
+longhorn-system csi-attacher-896ffc747-pt2xm 1/1 Running 0 3m21s
+longhorn-system csi-provisioner-688964c44b-295px 1/1 Terminating 0 25h
+longhorn-system csi-provisioner-688964c44b-c9gfk 0/1 CrashLoopBackOff 3 (40s ago) 3m20s
+longhorn-system csi-provisioner-688964c44b-lt62f 1/1 Running 1 (25h ago) 25h
+longhorn-system csi-provisioner-688964c44b-thxp4 1/1 Terminating 0 3h50m
+longhorn-system csi-provisioner-688964c44b-wz4f2 0/1 CrashLoopBackOff 3 (38s ago) 3m21s
+longhorn-system csi-resizer-6585bb54-p8582 1/1 Terminating 0 25h
+longhorn-system csi-resizer-6585bb54-rjf9g 1/1 Running 1 (25h ago) 25h
+longhorn-system csi-resizer-6585bb54-v6gfm 1/1 Terminating 0 3h50m
+longhorn-system csi-resizer-6585bb54-v79fm 1/1 Running 0 3m20s
+longhorn-system csi-resizer-6585bb54-wlcff 1/1 Running 0 3m21s
+longhorn-system csi-snapshotter-65884686fc-5557t 1/1 Terminating 0 25h
+longhorn-system csi-snapshotter-65884686fc-9th7x 1/1 Running 0 3m20s
+longhorn-system csi-snapshotter-65884686fc-bfj54 1/1 Running 0 3h50m
+longhorn-system csi-snapshotter-65884686fc-qft4l 1/1 Running 2 (25h ago) 25h
+longhorn-system engine-image-ei-ff1cedad-fbz5q 1/1 Running 0 25h
+longhorn-system engine-image-ei-ff1cedad-s7f8d 1/1 Running 4 (123m ago) 25h
+longhorn-system engine-image-ei-ff1cedad-zrcmb 1/1 Running 0 25h
+longhorn-system instance-manager-4a574f469591fe396c56d89fddcfe95e 1/1 Terminating 0 25h
+longhorn-system instance-manager-7a729c566da25ba7618ed9d536735638 1/1 Running 0 123m
+longhorn-system instance-manager-ec5d197899546ca849e3a3786a40eb77 1/1 Running 0 25h
+longhorn-system longhorn-csi-plugin-dpvxd 3/3 Running 13 (123m ago) 25h
+longhorn-system longhorn-csi-plugin-f2k6z 3/3 Running 1 (25h ago) 25h
+longhorn-system longhorn-csi-plugin-m5469 3/3 Running 1 (25h ago) 25h
+longhorn-system longhorn-driver-deployer-5d7995fc74-8qszw 1/1 Terminating 0 3h50m
+longhorn-system longhorn-driver-deployer-5d7995fc74-c9jjs 0/1 Init:0/1 0 3m20s
+longhorn-system longhorn-manager-7phz2 2/2 Running 0 25h
+longhorn-system longhorn-manager-99plg 2/2 Running 8 (123m ago) 25h
+longhorn-system longhorn-manager-mjc6w 2/2 Running 0 25h
+longhorn-system longhorn-ui-7fc9b4667f-pcl5r 1/1 Terminating 0 25h
+longhorn-system longhorn-ui-7fc9b4667f-r4x95 0/1 Error 4 (76s ago) 3m20s
+longhorn-system longhorn-ui-7fc9b4667f-vsjwp 1/1 Running 0 3h50m
+metallb-system controller-7dbf649dcc-zm9sq 1/1 Running 0 26h
+metallb-system speaker-c2mb4 1/1 Running 4 (123m ago) 26h
+metallb-system speaker-j7k5b 1/1 Running 0 26h
+metallb-system speaker-wsxw7
