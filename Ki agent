@@ -27,3 +27,49 @@ Sehr gerne. Und keine Sorge wegen der Autokorrektur – aus „LlamaIndex“ wir
 ​Zusammenfassung für das Meeting:
 Sie kaufen nicht "eine Software", sondern Sie bauen eine Pipeline. LangChain orchestriert Gemini, Gemini schreibt Python-Code mit pandas und scikit-learn, und dieser Code läuft in einem sicheren Docker-Container auf Ihren Neo4j- und SQL-Daten.
 ​Möchten Sie, dass wir für das Meeting noch Argumente vorbereiten, ob man dieses System eher als "Cloud-Lösung" oder "On-Premise" (im eigenen Rechenzentrum) aufbauen sollte? Das ist meistens die erste Frage der IT-Security.
+
+
+Das ist ein perfektes Timing für Ihr Meeting. Wenn Sie heute die Architektur pitchen, ist es wichtig, den Zuhörern die Angst vor einer "Blackbox-KI" zu nehmen und stattdessen ein logisches, nachvollziehbares System aus bewährten Daten-Tools und einem intelligenten KI-Orchestrator zu präsentieren.
+Hier ist ein Entwurf für Ihre Präsentation, strukturiert in klare "Folien". Sie können diese Struktur direkt für Ihre PowerPoint-Slides übernehmen.
+Folie 1: Titel
+Titel: KI-gestützte Ursachenanalyse (Root Cause Analysis) für komplexe Produkte
+Untertitel: Vom reaktiven Troubleshooting zur proaktiven, domänenübergreifenden Fehlererkennung
+Agenda: Konzept, Agenten-Fähigkeiten, Tech-Stack, Architektur, Praxisbeispiel
+Folie 2: Generelles Konzept – Wie funktioniert das?
+Kernbotschaft: Wir ersetzen statische Dashboards durch einen dynamischen, fragenden Analysten.
+Das Problem bisher: Daten zu Bauteilen, Montage und Tests liegen in Silos (ERP, MES, QA-Systeme). Bei Fehlern suchen Ingenieure manuell nach Nadeln im Heuhaufen.
+Der neue Ansatz (Agentic AI): Ein KI-Agent fungiert als intelligenter Analyst. Er "kennt" nicht alle Daten auswendig, aber er weiß, wie er die richtigen Systeme bedienen muss, um die Antworten zu berechnen.
+Der Paradigmenwechsel: Wir programmieren nicht mehr für jede mögliche Fehlerkombination eine eigene Abfrage. Wir geben dem Agenten die Werkzeuge, damit er auf Zuruf dynamische Abfragen und Korrelationsanalysen erstellt.
+Folie 3: Was muss der Agent können? (Core Capabilities)
+Kernbotschaft: Ein Agent ist mehr als nur ein Chatbot; er ist eine Maschine, die handelt.
+1. Natural Language Understanding (NLU): Er muss Ingenieurs-Fragen in Fachsprache verstehen (z.B. "Warum fällt Baugruppe A beim Stresstest Z häufiger aus?").
+2. Chain-of-Thought Reasoning (Logisches Denken): Er muss ein Problem in Teilschritte zerlegen (Schritt 1: Finde alle Baugruppen A. Schritt 2: Isoliere die Ausfälle bei Test Z. Schritt 3: Vergleiche Stücklisten der Ausfälle mit bestandenen Tests).
+3. Tool Use / API Calling: Die wichtigste Fähigkeit. Der Agent muss selbstständig SQL-Abfragen schreiben, um Datenbanken zu durchsuchen, und Python-Skripte schreiben, um statistische Korrelationen zu berechnen.
+4. Synthese: Rohe Tabellen und statistische p-Werte wieder in eine verständliche Antwort für den Menschen übersetzen.
+Folie 4: Welche Tools & Bausteine braucht man? (Tech Stack)
+Kernbotschaft: Wir bauen auf unserer bestehenden Dateninfrastruktur auf.
+Large Language Model (LLM): Das "Gehirn" (z.B. Gemini Pro), das den Code schreibt und die Planung übernimmt.
+Agenten-Framework: Ein Framework wie LangChain oder LlamaIndex, das dem LLM erlaubt, Werkzeuge zu nutzen und Gedankengänge zu strukturieren.
+Data Warehouse / Data Lake: Der zentrale Ort, an dem Traceability-Daten (welches Teil ist in welchem Produkt) und Testdaten (Messwerte) zusammenliegen.
+Code Execution Environment (Sandbox): Eine sichere Umgebung, in der der Agent den von ihm geschriebenen Python-Code (z.B. für pandas oder scikit-learn Korrelationsmatrizen) ausführen darf, um die Daten zu analysieren.
+Folie 5: Die Systemarchitektur
+Kernbotschaft: Ein sicherer Kreislauf aus Anfrage, Code-Generierung, Ausführung und Antwort.
+User Interface: Der Ingenieur stellt eine Frage per Chat.
+Orchestrator (Der Agent): Analysiert die Frage und entscheidet, welche Tools er braucht.
+Tool 1 - Database Query: Der Agent generiert SQL, schickt es an die Datenbank und holt sich die relevanten Rohdaten (Test-IDs, Bauteil-IDs, Messwerte).
+Tool 2 - Data Science Interpreter: Der Agent schreibt ein Python-Skript, um die Korrelationen zwischen den abgerufenen Bauteilen und den Testfehlern zu berechnen. Das Skript läuft in einer Sandbox.
+Output: Die Ergebnisse (Zahlen/Graphen) gehen zurück an den Agenten, der daraus die finale Antwort formuliert.
+Folie 6: Konkreter Ablauf anhand eines Beispiels (Workflow)
+Kernbotschaft: So sieht die Maschine bei der Arbeit aus.
+Szenario: Der Prüfstand meldet eine 12%ige Fehlerquote bei Endprodukt "Alpha" im Hitzetest (Test Z).
+Schritt 1 (User): "Analysiere die Ausfälle von Produkt Alpha beim Hitzetest im letzten Monat. Finde heraus, ob bestimmte Unterbauteile oder Messwert-Kombinationen korrelieren."
+Schritt 2 (Agent denkt): "Ich brauche erst die Stücklisten aller 'Alpha'-Produkte des letzten Monats und deren Ergebnisse aus Test Z. Dann muss ich auf Korrelationen prüfen."
+Schritt 3 (Agent handelt - SQL): Generiert SQL-Code -> Zieht eine Tabelle mit 5.000 Zeilen (Produkt-ID, Status Test Z, Seriennummer Bauteil X, Seriennummer Bauteil Y, Lieferant).
+Schritt 4 (Agent handelt - Python): Schreibt ein Python-Skript für eine Korrelationsanalyse (z.B. Random Forest Feature Importance). Die Sandbox führt es aus.
+Schritt 5 (Ergebnis): Das Skript spuckt aus: Hohe Korrelation (r = 0.85) zwischen Unterbauteil X von Lieferant B und Ausfall im Hitzetest.
+Schritt 6 (Antwort an User): "Die Analyse der 5.000 Datensätze zeigt: Die Ausfälle beim Hitzetest korrelieren stark mit Unterbauteil X, jedoch fast ausschließlich, wenn dieses von Lieferant B stammt. Ich empfehle, die Spezifikationen von Lieferant B bezüglich Hitzebeständigkeit zu prüfen. Möchtest du ein Streudiagramm der genauen Messwerte sehen?"
+Folie 7: Zusammenfassung
+Die KI "errät" keine Fehler, sie wendet harte Mathematik auf unsere Daten an – aber eben automatisch und skaliert.
+Wir sparen unzählige Stunden manueller Datenaufbereitung.
+Voraussetzung: Eine saubere, verknüpfbare Datenbasis (Traceability).
+Möchten Sie, dass ich für eine dieser Folien (z.B. die Architektur oder das Beispiel) noch tiefergehende Sprechernotizen formuliere, damit Sie auf kritische Rückfragen der IT-Abteilung vorbereitet sind?
