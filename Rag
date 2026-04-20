@@ -1,0 +1,163 @@
+import os
+from pathlib import Path
+from haystack import Pipeline
+from haystack.components.converters import PyPDFToDocument
+from haystack.components.preprocessors import DocumentCleaner, DocumentSplitter
+from haystack.components.writers import DocumentWriter
+from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+from haystack_integrations.components.embedders.ollama import OllamaDocumentEmbedder
+from haystack_integrations.components.embedders.fastembed import FastembedSparseDocumentEmbedder
+
+# --- KONFIGURATION ---
+QDRANT_HOST = "localhost"
+INDEX_NAME = "EnterpriseHybridDocs"
+PDF_DIR = "./data" # Erstelle diesen Ordner und lege PDFs hinein
+
+def run_ingestion():
+    # 1. Store mit Hybrid-Unterstützung initialisieren
+    document_store = QdrantDocumentStore(
+        host=QDRANT_HOST,
+        index=INDEX_NAME,
+        embedding_dim=768,       # Dimension für Nomic V2
+        use_sparse_embeddings=True, # Aktiviert Sparse-Vektoren für Keywords
+        recreate_index=False
+    )
+
+    # 2. Komponenten definieren
+    converter = PyPDFToDocument()
+    cleaner = DocumentCleaner(remove_empty_lines=True, remove_extra_whitespaces=True)
+    splitter = DocumentSplitter(split_by="word", split_length=250, split_overlap=30)
+    
+    # Dense Embedder (Nomic via Ollama)
+    dense_embedder = OllamaDocumentEmbedder(
+        model="nomic-embed-text-v2-moe",
+        url="http://localhost:11434/api/embeddings",
+        prefix="search_document: "
+    )
+    
+    # Sparse Embedder (Lokales BM25 via Fastembed - extrem schnell)
+    sparse_embedder = FastembedSparseDocumentEmbedder(model="Qdrant/bm25")
+    
+    writer = DocumentWriter(document_store=document_store)
+
+    # 3. Pipeline aufbauen
+    pipeline = Pipeline()
+    pipeline.add_component("converter", converter)
+    pipeline.add_component("cleaner", cleaner)
+    pipeline.add_component("splitter", splitter)
+    pipeline.add_component("dense_embedder", dense_embedder)
+    pipeline.add_component("sparse_embedder", sparse_embedder)
+    pipeline.add_component("writer", writer)
+
+    # Verbindungen (Splitter geht in beide Embedder)
+    pipeline.connect("converter", "cleaner")
+    pipeline.connect("cleaner", "splitter")
+    pipeline.connect("splitter", "dense_embedder")
+    pipeline.connect("dense_embedder", "sparse_embedder")
+    pipeline.connect("sparse_embedder", "writer")
+
+    # 4. Ausführen
+    pdf_path = Path(PDF_DIR)
+    if not pdf_path.exists():
+        pdf_path.mkdir()
+    
+    files = [pdf_path / f for f in os.listdir(pdf_path) if f.endswith(".pdf")]
+    if files:
+        print(f"Verarbeite {len(files)} Dokumente...")
+        pipeline.run({"converter": {"sources": files}})
+        print("Indexing abgeschlossen.")
+    else:
+        print("Keine PDFs gefunden. Bitte PDFs in den Ordner ./data legen.")
+
+if __name__ == "__main__":
+    run_ingestion()
+
+
+
+
+
+main.py
+
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+import uvicorn
+
+from haystack import Pipeline
+from haystack.components.rankers import SentenceTransformersSimilarityRanker
+from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
+from haystack_integrations.components.embedders.ollama import OllamaTextEmbedder
+from haystack_integrations.components.embedders.fastembed import FastembedSparseTextEmbedder
+
+# --- SETUP ---
+API_KEY = "mein_geheimer_schlüssel_123" # In Open WebUI hinterlegen
+document_store = QdrantDocumentStore(host="localhost", index="EnterpriseHybridDocs", use_sparse_embeddings=True)
+
+app = FastAPI(title="Industrial RAG Tool Server")
+
+# --- HYBRID RETRIEVAL PIPELINE ---
+rag_pipe = Pipeline()
+
+# Zweig 1: Semantische Suche (Dense)
+rag_pipe.add_component("dense_text_embedder", OllamaTextEmbedder(
+    model="nomic-embed-text-v2-moe", 
+    prefix="search_query: "
+))
+
+# Zweig 2: Keyword Suche (Sparse)
+rag_pipe.add_component("sparse_text_embedder", FastembedSparseTextEmbedder(model="Qdrant/bm25"))
+
+# Hybrid Retriever (kombiniert beides automatisch)
+rag_pipe.add_component("retriever", QdrantEmbeddingRetriever(document_store=document_store, top_k=20))
+
+# Reranker (Die Qualitätsstufe)
+rag_pipe.add_component("reranker", SentenceTransformersSimilarityRanker(
+    model="BAAI/bge-reranker-base", 
+    top_k=5
+))
+
+# Verbindungen
+rag_pipe.connect("dense_text_embedder.embedding", "retriever.query_embedding")
+rag_pipe.connect("sparse_text_embedder.sparse_embedding", "retriever.query_sparse_embedding")
+rag_pipe.connect("retriever.documents", "reranker.documents")
+
+class QueryModel(BaseModel):
+    query: str
+
+# --- TOOL ENDPUNKT ---
+@app.post("/search")
+async def search_enterprise_docs(request: QueryModel, authorization: str = Header(None)):
+    """
+    Durchsucht Firmendokumente mittels Hybrid-Search (Vektoren + Keywords). 
+    Findet technische Details, Seriennummern und Konzepte.
+    """
+    # Sicherheit Check
+    if not authorization or authorization != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        # Pipeline ausführen
+        results = rag_pipe.run({
+            "dense_text_embedder": {"text": request.query},
+            "sparse_text_embedder": {"text": request.query},
+            "reranker": {"query": request.query}
+        })
+
+        docs = results["reranker"]["documents"]
+        
+        # Antwort für das LLM in Open WebUI formatieren
+        response_text = "Relevante Informationen aus der Wissensdatenbank:\n\n"
+        for d in docs:
+            source = d.meta.get("file_name", "Unbekannt")
+            score = round(d.score, 2)
+            response_text += f"--- QUELLE: {source} (Relevanz: {score}) ---\n{d.content}\n\n"
+        
+        return {"result": response_text}
+
+    except Exception as e:
+        print(f"Fehler: {e}")
+        raise HTTPException(status_code=500, detail="Interner Serverfehler bei der Suche.")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+             
